@@ -93,8 +93,8 @@ GCS_SERVICE_HOST = "gcs.service.host"
 GCS_DEFAULT_LOCATION = "gcs.default-bucket-location"
 GCS_VERSION_AWARE = "gcs.version-aware"
 PYARROW_USE_LARGE_TYPES_ON_READ = "pyarrow.use-large-types-on-read"
-COLUMN_KEY="table.column-key"
-FOOTER_KEY="table.footer-key"
+COLUMN_KEY = "table.column-key"
+FOOTER_KEY = "table.footer-key"
 
 @runtime_checkable
 class InputStream(Protocol):
