@@ -25,6 +25,11 @@ with the pyarrow library.
 
 from __future__ import annotations
 
+from base64 import (
+    b64decode,
+    b64encode
+)
+from boto3 import client
 import concurrent.futures
 import fnmatch
 import functools
@@ -71,6 +76,12 @@ from pyarrow.fs import (
     FileType,
     FSSpecHandler,
 )
+from pyarrow.parquet.encryption import (
+    CryptoFactory,
+    EncryptionConfiguration,
+    KmsClient,
+    KmsConnectionConfig
+)
 from sortedcontainers import SortedList
 
 from pyiceberg.conversions import to_bytes
@@ -91,6 +102,8 @@ from pyiceberg.io import (
     AWS_ROLE_SESSION_NAME,
     AWS_SECRET_ACCESS_KEY,
     AWS_SESSION_TOKEN,
+    COLUMN_KEY,
+    FOOTER_KEY,
     GCS_DEFAULT_LOCATION,
     GCS_SERVICE_HOST,
     GCS_TOKEN,
@@ -197,9 +210,51 @@ MAP_KEY_NAME = "key"
 MAP_VALUE_NAME = "value"
 DOC = "doc"
 UTC_ALIASES = {"UTC", "+00:00", "Etc/UTC", "Z"}
+parquet_modular_encryption = None
 
 T = TypeVar("T")
 
+class ParquetModularEncryption():
+    def __init__(self, aws_access_key_id: str, aws_secret_access_key: str, region_name: str):
+        self.aws_access_key_id = aws_access_key_id
+        self.aws_secret_access_key = aws_secret_access_key
+        self.region_name = region_name
+
+    def get_kms_connection_config(self) -> KmsConnectionConfig:
+        if (self.aws_access_key_id == None) or (self.aws_secret_access_key == None) or (self.region_name == None):
+            raise Exception("AWS Credentials are not set.")
+        return KmsConnectionConfig(custom_kms_conf={"aws_access_key_id": self.aws_access_key_id, "aws_secret_access_key": self.aws_secret_access_key, "region_name": self.region_name})
+    
+    def get_crypto_factory(self) -> CryptoFactory:
+        kms_connection_config = self.get_kms_connection_config()
+
+        class ParquetModularEncryptionKmsClient(KmsClient):
+            def __init__(self, kms_connection_config):
+                KmsClient.__init__(self)
+                self.client = client(aws_access_key_id=kms_connection_config.custom_kms_conf["aws_access_key_id"], aws_secret_access_key=kms_connection_config.custom_kms_conf["aws_secret_access_key"], region_name=kms_connection_config.custom_kms_conf["region_name"], service_name="kms")
+            
+            def wrap_key(self, key_bytes, master_key_identifier):
+                return b64encode(s=self.client.encrypt(KeyId=master_key_identifier, Plaintext=key_bytes)["CiphertextBlob"])
+            
+            def unwrap_key(self, wrapped_key, master_key_identifier):
+                return self.client.decrypt(CiphertextBlob=b64decode(s=wrapped_key), KeyId=master_key_identifier)["Plaintext"]
+
+        def kms_client_factory(kms_connection_config):
+            return ParquetModularEncryptionKmsClient(kms_connection_config=kms_connection_config)
+
+        return CryptoFactory(kms_client_factory=kms_client_factory)
+
+    def get_decryption_properties(self):
+        if (self.aws_access_key_id == None) or (self.aws_secret_access_key == None) or (self.region_name == None):
+            return None
+        else:
+            return self.get_crypto_factory().file_decryption_properties(kms_connection_config=self.get_kms_connection_config())
+
+    def get_encryption_properties(self, column_key: Dict[str, List[str]], footer_key: str):
+        if (column_key == None) or (footer_key == None):
+            return None
+        else:
+            return self.get_crypto_factory().file_encryption_properties(encryption_config=EncryptionConfiguration(column_keys=eval(column_key), footer_key=footer_key), kms_connection_config=self.get_kms_connection_config())
 
 @lru_cache
 def _cached_resolve_s3_region(bucket: str) -> Optional[str]:
@@ -381,6 +436,13 @@ class PyArrowFileIO(FileIO):
             return uri.scheme, uri.netloc, f"{uri.netloc}{uri.path}"
 
     def _initialize_fs(self, scheme: str, netloc: Optional[str] = None) -> FileSystem:
+        global parquet_modular_encryption
+        parquet_modular_encryption = ParquetModularEncryption(
+            aws_access_key_id=get_first_property_value(self.properties, AWS_ACCESS_KEY_ID, S3_ACCESS_KEY_ID),
+            aws_secret_access_key=get_first_property_value(self.properties, AWS_SECRET_ACCESS_KEY, S3_SECRET_ACCESS_KEY),
+            region_name=get_first_property_value(self.properties, AWS_REGION, S3_REGION)
+        )
+        
         """Initialize FileSystem for different scheme."""
         if scheme in {"oss"}:
             return self._initialize_oss_fs()
@@ -1388,7 +1450,11 @@ def _task_to_record_batches(
     partition_spec: Optional[PartitionSpec] = None,
 ) -> Iterator[pa.RecordBatch]:
     _, _, path = _parse_location(task.file.file_path)
-    arrow_format = ds.ParquetFileFormat(pre_buffer=True, buffer_size=(ONE_MEGABYTE * 8))
+    arrow_format = ds.ParquetFileFormat(
+        buffer_size=(ONE_MEGABYTE * 8),
+        decryption_properties=parquet_modular_encryption.get_decryption_properties(),
+        pre_buffer=True
+    )
     with fs.open_input_file(path) as fin:
         fragment = arrow_format.make_fragment(fin)
         physical_schema = fragment.physical_schema
@@ -2445,9 +2511,9 @@ def write_file(io: FileIO, table_metadata: TableMetadata, tasks: Iterator[WriteT
             with pq.ParquetWriter(fos, schema=arrow_table.schema, **parquet_writer_kwargs) as writer:
                 writer.write(arrow_table, row_group_size=row_group_size)
         statistics = data_file_statistics_from_parquet_metadata(
-            parquet_metadata=writer.writer.metadata,
-            stats_columns=compute_statistics_plan(file_schema, table_metadata.properties),
             parquet_column_mapping=parquet_path_to_id_mapping(file_schema),
+            parquet_metadata=pq.read_metadata(decryption_properties=parquet_modular_encryption.get_decryption_properties(), where=file_path),
+            stats_columns=compute_statistics_plan(file_schema, table_metadata.properties)
         )
         data_file = DataFile.from_args(
             content=DataFileContent.DATA,
@@ -2592,6 +2658,10 @@ def _get_parquet_writer_kwargs(table_properties: Properties) -> Dict[str, Any]:
             properties=table_properties,
             property_name=TableProperties.PARQUET_DICT_SIZE_BYTES,
             default=TableProperties.PARQUET_DICT_SIZE_BYTES_DEFAULT,
+        ),
+        "encryption_properties": parquet_modular_encryption.get_encryption_properties(
+            column_key=table_properties.get(COLUMN_KEY, None),
+            footer_key=table_properties.get(FOOTER_KEY, None)
         ),
         "write_batch_size": property_as_int(
             properties=table_properties,
