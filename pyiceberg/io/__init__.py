@@ -96,8 +96,7 @@ GCS_VERSION_AWARE = "gcs.version-aware"
 HF_ENDPOINT = "hf.endpoint"
 HF_TOKEN = "hf.token"
 PYARROW_USE_LARGE_TYPES_ON_READ = "pyarrow.use-large-types-on-read"
-COLUMN_KEY = "table.column-key"
-FOOTER_KEY = "table.footer-key"
+
 
 @runtime_checkable
 class InputStream(Protocol):
